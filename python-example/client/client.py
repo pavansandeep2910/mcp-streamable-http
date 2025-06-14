@@ -1,4 +1,4 @@
-"""MCP Streamable HTTP Client"""
+"""MCP Streamable HTTP Client with OpenAI GPT-4o"""
 
 import argparse
 import asyncio
@@ -8,7 +8,7 @@ from contextlib import AsyncExitStack
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,7 +21,7 @@ class MCPClient:
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
+        self.openai = OpenAI()
 
     async def connect_to_streamable_http_server(
         self, server_url: str, headers: Optional[dict] = None
@@ -39,54 +39,70 @@ class MCPClient:
         await self.session.initialize()
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
+        """Process a query using GPT-4o and available tools"""
         messages = [{"role": "user", "content": query}]
 
         response = await self.session.list_tools()
         available_tools = [
             {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.inputSchema,
+                "type": "function",  # OpenAI requires this format
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema,
+                }
             }
             for tool in response.tools
         ]
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
+        # Initial OpenAI API call
+        response = self.openai.chat.completions.create(
+            model="gpt-4o",
             max_tokens=1000,
             messages=messages,
-            tools=available_tools,
+            tools=available_tools if available_tools else None,
         )
 
         # Process response and handle tool calls
         final_text = []
+        message = response.choices[0].message
 
-        for content in response.content:
-            if content.type == "text":
-                final_text.append(content.text)
-            elif content.type == "tool_use":
-                tool_name = content.name
-                tool_args = content.input
+        if message.content:
+            final_text.append(message.content)
+
+        # Handle tool calls if present
+        if message.tool_calls:
+            # Add assistant message with tool calls to conversation
+            messages.append({
+                "role": "assistant", 
+                "content": message.content,
+                "tool_calls": message.tool_calls
+            })
+
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = eval(tool_call.function.arguments)  # Parse JSON string to dict
 
                 # Execute tool call
                 result = await self.session.call_tool(tool_name, tool_args)
                 final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
 
-                # Continue conversation with tool results
-                if hasattr(content, "text") and content.text:
-                    messages.append({"role": "assistant", "content": content.text})
-                messages.append({"role": "user", "content": result.content})
+                # Add tool result to messages
+                messages.append({
+                    "role": "tool",
+                    "content": str(result.content),
+                    "tool_call_id": tool_call.id
+                })
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1000,
-                    messages=messages,
-                )
+            # Get next response from GPT-4o with tool results
+            response = self.openai.chat.completions.create(
+                model="gpt-4o-2024-05-13",
+                max_tokens=1000,
+                messages=messages,
+            )
 
-                final_text.append(response.content[0].text)
+            if response.choices[0].message.content:
+                final_text.append(response.choices[0].message.content)
 
         return "\n".join(final_text)
 
